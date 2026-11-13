@@ -49,6 +49,13 @@ pub const DEFAULT_EMBED_PORT: u16 = 8128;
 /// binary that never comes up.
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// The health endpoint can answer a few milliseconds before the stderr drain
+/// thread copies the context diagnostics already written by llama.cpp. Poll a
+/// bounded number of snapshots so the effective microbatch log does not race
+/// that drain. Twenty sleeps cap the extra startup latency at 200 ms.
+const UBATCH_DIAGNOSTIC_READS: usize = 21;
+const UBATCH_DIAGNOSTIC_POLL: Duration = Duration::from_millis(10);
+
 /// How far past the preferred port the engine may look for one it can open.
 /// Bounded on purpose: twenty ports is far more than any desktop needs, and a
 /// walk that never ends is a hang with extra steps.
@@ -109,6 +116,10 @@ pub struct EngineTuning {
     pub cache_type_v: String,
     /// CPU threads for generation. <=0 = auto (omitted).
     pub threads: i32,
+    /// Physical microbatch size. 0 = llama.cpp default / inherited environment
+    /// (omitted); the explicit expert choices are whitelisted in
+    /// `validated_ubatch` before they can reach the sidecar.
+    pub ubatch: u32,
     /// GPU layers to offload. <0 = all (999, today's behavior); >=0 explicit
     /// (0 = CPU-only is a valid expert choice on RAM-starved boxes).
     pub gpu_layers: i32,
@@ -144,6 +155,7 @@ impl Default for EngineTuning {
             cache_type_k: "f16".into(),
             cache_type_v: "f16".into(),
             threads: -1,
+            ubatch: 0,
             gpu_layers: -1,
             mlock: false,
             no_mmap: false,
@@ -157,6 +169,15 @@ impl Default for EngineTuning {
 
 /// KV cache types this build of llama-server accepts and we consider sane.
 const KV_CACHE_TYPES: &[&str] = &["f16", "bf16", "q8_0", "q4_0"];
+
+/// Microbatch sizes offered by the expert control. An edited settings file
+/// cannot forward an arbitrary value to llama-server: unsupported values
+/// safely fall back to Auto (the flag is omitted).
+const UBATCH_CHOICES: &[u32] = &[128, 256, 512];
+
+fn validated_ubatch(tuning: &EngineTuning) -> Option<u32> {
+    UBATCH_CHOICES.contains(&tuning.ubatch).then_some(tuning.ubatch)
+}
 
 /// The context size actually passed to the server (`tuning.ctx`, with 0
 /// falling back to the 8192 default — see `EngineTuning::ctx`).
@@ -889,6 +910,10 @@ pub(crate) fn server_args(
         "-lv".into(),
         "4".into(),
     ];
+    if let Some(ubatch) = validated_ubatch(tuning) {
+        args.push("--ubatch-size".into());
+        args.push(ubatch.to_string());
+    }
     if matches!(tuning.flash_attn.as_str(), "on" | "off") {
         args.push("-fa".into());
         args.push(tuning.flash_attn.clone());
@@ -990,6 +1015,51 @@ pub(crate) fn command_line(binary: &Path, args: &[String]) -> String {
         line.push_str(&quote(a));
     }
     line
+}
+
+/// The value LU explicitly requested in this argv. "auto" means the app left
+/// llama.cpp's default and any inherited LLAMA_ARG_UBATCH untouched.
+fn requested_ubatch_in(args: &[String]) -> String {
+    args.windows(2)
+        .find_map(|pair| match pair[0].as_str() {
+            "--ubatch-size" | "-ub" => Some(pair[1].clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| "auto".into())
+}
+
+/// Read the value llama.cpp actually accepted. b11960 prints this during
+/// context initialization; it is the effective value after defaults,
+/// environment variables, command-line precedence and context limits.
+fn effective_ubatch_from_startup(startup: &str) -> Option<u32> {
+    startup.lines().find_map(|line| {
+        // Match the context's authoritative value rather than any warning or
+        // debug line that merely mentions an n_ubatch-related limit.
+        let (_, rest) = line.split_once("llama_context: n_ubatch")?;
+        let (_, value) = rest.split_once('=')?;
+        value.split_whitespace().next()?.parse().ok()
+    })
+}
+
+/// Take at least one startup-diagnostic snapshot and briefly retry while the
+/// authoritative effective-microbatch line has not reached the drain buffer.
+/// The caller supplies the pause so the bounded decision is unit-testable
+/// without sleeping. The last real snapshot is returned when the limit ends.
+fn startup_diagnostics_until_ubatch(
+    mut snapshot: impl FnMut() -> String,
+    mut pause: impl FnMut(),
+    max_reads: usize,
+) -> String {
+    let reads = max_reads.max(1);
+    let mut startup = String::new();
+    for read in 0..reads {
+        startup = snapshot();
+        if effective_ubatch_from_startup(&startup).is_some() || read + 1 == reads {
+            break;
+        }
+        pause();
+    }
+    startup
 }
 
 /// Build the `llama-server` argv for the EMBEDDINGS server (P5). `--embeddings`
@@ -4432,6 +4502,7 @@ fn spawn_engine_attempt(
         target: "engine",
         port,
         ctx = ctx.unwrap_or_default(),
+        ubatch_requested = %requested_ubatch_in(args),
         model_bytes = std::fs::metadata(model_path).map(|m| m.len()).unwrap_or(0),
         command = %command_line(binary, args),
         "starting the LU Engine llama-server"
@@ -4581,9 +4652,31 @@ fn spawn_engine_attempt(
             }
         };
         if ours_alive {
-            return Ok(diagnostics
-                .map(|(buf, _)| super::shell::captured_text(&buf))
-                .unwrap_or_default());
+            let startup = diagnostics
+                .map(|(buf, _)| {
+                    startup_diagnostics_until_ubatch(
+                        || super::shell::captured_text(&buf),
+                        || std::thread::sleep(UBATCH_DIAGNOSTIC_POLL),
+                        UBATCH_DIAGNOSTIC_READS,
+                    )
+                })
+                .unwrap_or_default();
+            match effective_ubatch_from_startup(&startup) {
+                Some(effective) => tracing::info!(
+                    target: "engine",
+                    port,
+                    ubatch_requested = %requested_ubatch_in(args),
+                    ubatch_effective = effective,
+                    "the LU Engine reported its effective microbatch"
+                ),
+                None => tracing::warn!(
+                    target: "engine",
+                    port,
+                    ubatch_requested = %requested_ubatch_in(args),
+                    "the LU Engine did not report an effective microbatch in its startup diagnostics"
+                ),
+            }
+            return Ok(startup);
         }
         if stop_was_requested(state) {
             // Health answered and the stop came right behind it. Our child is
@@ -6842,6 +6935,7 @@ mod tests {
             cache_type_k: "q8_0".into(),
             cache_type_v: "q8_0".into(),
             threads: 8,
+            ubatch: 256,
             gpu_layers: 20,
             mlock: true,
             no_mmap: true,
@@ -6857,12 +6951,118 @@ mod tests {
                 "--ctx-size", "16384",
                 "-ngl", "20",
                 "-lv", "4",
+                "--ubatch-size", "256",
                 "-fa", "on",
                 "-ctk", "q8_0",
                 "-ctv", "q8_0",
                 "-t", "8",
                 "--load-mode", "mlock",
             ]
+        );
+    }
+
+    #[test]
+    fn microbatch_auto_keeps_the_legacy_argv() {
+        let args = build_server_args("/m.gguf", &EngineTuning::default(), 8127, None, None, None);
+
+        assert!(!args.iter().any(|arg| arg == "--ubatch-size" || arg == "-ub"), "{args:?}");
+    }
+
+    #[test]
+    fn only_supported_microbatch_values_reach_llama_server() {
+        for value in [128, 256, 512] {
+            let tuning = EngineTuning { ubatch: value, ..Default::default() };
+            let args = build_server_args("/m.gguf", &tuning, 8127, None, None, None);
+            assert!(
+                args.windows(2).any(|pair| pair[0] == "--ubatch-size" && pair[1] == value.to_string()),
+                "{value} missing from {args:?}",
+            );
+        }
+
+        for value in [1, 127, 129, 255, 257, 511, 513, u32::MAX] {
+            let tuning = EngineTuning { ubatch: value, ..Default::default() };
+            let args = build_server_args("/m.gguf", &tuning, 8127, None, None, None);
+            assert!(!args.iter().any(|arg| arg == "--ubatch-size" || arg == "-ub"), "invalid {value} reached {args:?}");
+        }
+    }
+
+    #[test]
+    fn effective_microbatch_is_read_from_the_engine_startup_diagnostic() {
+        let startup = "llama_context: n_batch               = 2048\nllama_context: n_ubatch              = 128\n";
+
+        assert_eq!(effective_ubatch_from_startup(startup), Some(128));
+        assert_eq!(
+            effective_ubatch_from_startup("warning: n_ubatch cap = 256\n"),
+            None,
+            "only llama_context's effective-value diagnostic is authoritative",
+        );
+        assert_eq!(effective_ubatch_from_startup("llama_context: n_batch = 2048\n"), None);
+        assert_eq!(effective_ubatch_from_startup("llama_context: n_ubatch = invalid\n"), None);
+    }
+
+    #[test]
+    fn effective_microbatch_capture_tolerates_a_late_drain_snapshot() {
+        use std::cell::Cell;
+
+        let reads = Cell::new(0);
+        let pauses = Cell::new(0);
+        let startup = startup_diagnostics_until_ubatch(
+            || {
+                let read = reads.get();
+                reads.set(read + 1);
+                if read == 0 {
+                    "llama_context: n_batch = 2048\n".into()
+                } else {
+                    "llama_context: n_batch = 2048\nllama_context: n_ubatch = 128\n".into()
+                }
+            },
+            || pauses.set(pauses.get() + 1),
+            3,
+        );
+
+        assert_eq!(effective_ubatch_from_startup(&startup), Some(128));
+        assert_eq!(reads.get(), 2);
+        assert_eq!(pauses.get(), 1);
+    }
+
+    #[test]
+    fn effective_microbatch_capture_is_bounded_and_keeps_the_last_real_snapshot() {
+        use std::cell::Cell;
+
+        let reads = Cell::new(0);
+        let pauses = Cell::new(0);
+        let startup = startup_diagnostics_until_ubatch(
+            || {
+                let read = reads.get() + 1;
+                reads.set(read);
+                format!("diagnostic snapshot {read}\n")
+            },
+            || pauses.set(pauses.get() + 1),
+            3,
+        );
+
+        assert_eq!(startup, "diagnostic snapshot 3\n");
+        assert_eq!(reads.get(), 3);
+        assert_eq!(pauses.get(), 2);
+        assert_eq!(effective_ubatch_from_startup(&startup), None);
+    }
+
+    #[test]
+    fn microbatch_settings_are_backward_compatible_and_backend_validated() {
+        let legacy: EngineTuning = serde_json::from_str(r#"{"ctx":8192}"#).unwrap();
+        assert_eq!(legacy.ubatch, 0, "a profile from before the setting must remain Auto");
+
+        let explicit: EngineTuning = serde_json::from_str(r#"{"ubatch":256}"#).unwrap();
+        let explicit_args = build_server_args("/m.gguf", &explicit, 8127, None, None, None);
+        assert!(explicit_args.windows(2).any(|pair| pair[0] == "--ubatch-size" && pair[1] == "256"));
+
+        let unsupported: EngineTuning = serde_json::from_str(r#"{"ubatch":129}"#).unwrap();
+        let unsupported_args = build_server_args("/m.gguf", &unsupported, 8127, None, None, None);
+        assert!(!unsupported_args.iter().any(|arg| arg == "--ubatch-size" || arg == "-ub"));
+
+        assert!(
+            serde_json::from_str::<EngineTuning>(r#"{"ubatch":-1}"#).is_err(),
+            "a negative value must be rejected at IPC deserialization, before argv construction",
         );
     }
 
@@ -6890,6 +7090,7 @@ mod tests {
             cache_type_k: "q8_0".into(),
             cache_type_v: "q8_0".into(),
             threads: 8,
+            ubatch: 256,
             gpu_layers: 20,
             mlock: true,
             no_mmap: true,
@@ -6953,6 +7154,7 @@ mod tests {
             cache_type_k: "q8_0".into(),
             cache_type_v: "q4_0".into(),
             threads: 6,
+            ubatch: 128,
             gpu_layers: 24,
             mlock: true,
             no_mmap: true,
@@ -6977,6 +7179,7 @@ mod tests {
             "-ctk q8_0",
             "-ctv q4_0",
             "-t 6",
+            "--ubatch-size 128",
             "--load-mode mlock",
             "--slot-save-path /slots",
         ] {
@@ -7000,7 +7203,7 @@ mod tests {
             Path::new("/opt/lu/lu-llama-server"),
             &build_server_args("/m.gguf", &EngineTuning::default(), 8127, None, None, None),
         );
-        for unwanted in ["-ctk", "-ctv", "-fa", "-t ", "--load-mode", "--mmproj", "--slot-save-path"] {
+        for unwanted in ["-ctk", "-ctv", "-fa", "-t ", "--ubatch-size", "--load-mode", "--mmproj", "--slot-save-path"] {
             assert!(!line.contains(unwanted), "{unwanted:?} invented in:\n{line}");
         }
         assert!(line.contains("-ngl 999"), "{line}");
@@ -7431,6 +7634,16 @@ mod tests {
         assert_ne!(
             argv_without_gpu_layers(&a),
             argv_without_gpu_layers(&build_server_args("/m.gguf", &wider, 8127, None, None, Some(35)))
+        );
+        let smaller_ubatch = EngineTuning { ubatch: 128, ..Default::default() };
+        assert!(
+            !same_measured_request(
+                &a,
+                &build_server_args("/m.gguf", &smaller_ubatch, 8127, None, None, Some(35)),
+                true,
+                Some(8192),
+            ),
+            "Apply & Restart must not reuse an engine running with a different microbatch",
         );
     }
 

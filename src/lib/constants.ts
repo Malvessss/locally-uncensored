@@ -127,6 +127,7 @@ export const DEFAULT_SETTINGS: Settings = {
     cacheTypeK: 'f16',
     cacheTypeV: 'f16',
     threads: -1,
+    ubatch: 0,
     gpuLayers: -1,
     mlock: false,
     noMmap: false,

@@ -21,12 +21,20 @@ import { ENGINE_IDLE_UNLOAD_CHOICES, idleUnloadLabel, idleUnloadMinutes } from '
 import { engineOffloadWords, gpuLayersHint, gpuLayersLabel, gpuLayersTitle } from '../../lib/mac-pc-words'
 
 type KvType = BuiltinEngineTuning['cacheTypeK']
+type Ubatch = NonNullable<BuiltinEngineTuning['ubatch']>
 
 const KV_OPTIONS: { id: KvType; label: string }[] = [
   { id: 'f16', label: 'f16 — full precision (default)' },
   { id: 'bf16', label: 'bf16 — full size, wider range' },
   { id: 'q8_0', label: 'q8_0 — ~½ memory, near-lossless' },
   { id: 'q4_0', label: 'q4_0 — ~¼ memory, visible quality loss' },
+]
+
+const UBATCH_OPTIONS: { id: Ubatch; label: string }[] = [
+  { id: 0, label: 'Auto (llama.cpp default)' },
+  { id: 128, label: '128' },
+  { id: 256, label: '256' },
+  { id: 512, label: '512' },
 ]
 
 const numberInputCls =
@@ -181,6 +189,24 @@ export function BuiltinEngineSettings() {
       </div>
       <div className="text-[0.6rem] text-gray-500 leading-relaxed">
         0 = default (8192), raised up to 32768 when the graphics card has room for it. A number you type here is kept; if it costs layers on the graphics card, the line above says how many.
+      </div>
+
+      {/* Physical microbatch */}
+      <div className="flex items-center justify-between">
+        <span className="t-micro text-gray-700 dark:text-gray-400" title="Maximum number of tokens processed in one physical batch. Lower values reduce peak Vulkan work and scratch memory, but can reduce prompt-processing speed.">Microbatch</span>
+        <select
+          value={tuning.ubatch ?? 0}
+          onChange={(e) => patch({ ubatch: Number(e.target.value) as Ubatch })}
+          className={selectCls}
+          data-testid="engine-ubatch"
+        >
+          {UBATCH_OPTIONS.map((option) => (
+            <option key={option.id} value={option.id}>{option.label}</option>
+          ))}
+        </select>
+      </div>
+      <div className="t-micro text-gray-500 leading-relaxed">
+        Auto preserves llama.cpp&apos;s current default. A lower value can reduce Vulkan load during prompt processing; it does not guarantee that a device-lost fault is fixed.
       </div>
 
       {/* Flash attention */}
