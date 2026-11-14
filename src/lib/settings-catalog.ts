@@ -321,7 +321,7 @@ export const LOCK_RULES: readonly LockRule[] = [
 export const HIDDEN_KEYS: readonly string[] = [
   'onboardingDone', 'localEffortChosen', 'userAvatarDataUrl', 'extraModelIds', 'contextWindowByModel',
   'cloudSendWindowByModel', 'preferredImageModel', 'preferredVideoT2VModel', 'preferredVideoI2VModel',
-  'builtinEngine.mlock', 'builtinEngine.noMmap', 'builtinEngine.ctxChosen',
+  'builtinEngine.mlock', 'builtinEngine.noMmap', 'builtinEngine.ctxChosen', 'builtinEngine.ubatch',
   // Multi-GPU selection lives with its own detection UI, the architect model
   // with the model picker; not offered in v1.
   'gpuVendor', 'gpuIndices', 'gpuRoles', 'codexArchitectModel',

@@ -51,6 +51,8 @@ export interface BuiltinEngineTuning {
   cacheTypeV: 'f16' | 'bf16' | 'q8_0' | 'q4_0'
   /** CPU threads for generation. <=0 = auto. */
   threads: number
+  /** Physical microbatch. 0/absent = llama.cpp default. */
+  ubatch?: 0 | 128 | 256 | 512
   /** GPU layers to offload. -1 = all layers, 0 = CPU-only. */
   gpuLayers: number
   /** Pin the model in RAM (`--mlock`). */
