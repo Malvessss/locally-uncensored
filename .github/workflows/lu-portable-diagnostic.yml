@@ -3,7 +3,6 @@ name: LU portable diagnostic
 on:
   push:
     branches: [codex/lu-ubatch-diagnostic]
-    paths: [.github/workflows/lu-portable-diagnostic.yml]
 
 permissions:
   contents: read
