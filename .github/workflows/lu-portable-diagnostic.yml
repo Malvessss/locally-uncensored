@@ -1,0 +1,71 @@
+name: LU portable diagnostic
+
+on:
+  push:
+    branches: [codex/lu-ubatch-diagnostic]
+    paths: [.github/workflows/lu-portable-diagnostic.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    if: github.repository == 'Malvessss/locally-uncensored'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+      - name: Stage mandatory build placeholders
+        shell: bash
+        run: |
+          set -eu
+          triple=x86_64-pc-windows-msvc
+          mkdir -p src-tauri/bin "src-tauri/resources/llama/$triple"
+          touch "src-tauri/bin/lu-llama-server-$triple.exe"
+          touch "src-tauri/bin/lu-llama-cvector-generator-$triple.exe"
+          touch "src-tauri/resources/llama/$triple/ggml-cpu-x64.dll"
+      - run: npm ci
+      - name: Build portable application with embedded frontend
+        env:
+          LU_DIAGNOSTIC_NO_SANITY_PROBE: '1'
+        run: npm run tauri -- build --ci --no-bundle --target x86_64-pc-windows-msvc
+      - name: Package application and declared resources
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = New-Item -ItemType Directory "$env:RUNNER_TEMP/lu-portable"
+          $exe = Get-Item src-tauri/target/x86_64-pc-windows-msvc/release/locally-uncensored.exe
+          if ($exe.Length -eq 0) { throw 'Empty application executable' }
+          Copy-Item $exe.FullName $stage.FullName
+          $config = Get-Content src-tauri/tauri.windows.conf.json -Raw | ConvertFrom-Json -AsHashtable
+          foreach ($entry in $config.bundle.resources.GetEnumerator()) {
+            if ($entry.Key.StartsWith('resources/llama/')) { continue }
+            $files = @(Get-ChildItem -Path ("src-tauri/" + $entry.Key) -File)
+            if (!$files.Count) { throw "Missing resource $($entry.Key)" }
+            $target = Join-Path $stage.FullName $entry.Value
+            if ($entry.Value.EndsWith('/')) {
+              New-Item -ItemType Directory -Path $target -Force | Out-Null
+            } else {
+              New-Item -ItemType Directory -Path (Split-Path $target) -Force | Out-Null
+            }
+            Copy-Item -LiteralPath $files.FullName -Destination $target
+          }
+          @("base=4f6baf7263569301919b99cd77e2469492e49322", "head=$env:GITHUB_SHA", "requires=original b11960 sidecars and DLLs") |
+            Set-Content (Join-Path $stage.FullName 'BUILD.txt')
+          Get-ChildItem $stage.FullName -Recurse -File | Get-FileHash -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash)  $([IO.Path]::GetRelativePath($stage.FullName, $_.Path))" } |
+            Set-Content (Join-Path $stage.FullName 'SHA256SUMS.txt')
+          Compress-Archive -Path "$($stage.FullName)/*" -DestinationPath "$env:RUNNER_TEMP/LU-portable-diagnostic.zip"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: LU-portable-diagnostic
+          path: ${{ runner.temp }}/LU-portable-diagnostic.zip
+          if-no-files-found: error
+          retention-days: 7

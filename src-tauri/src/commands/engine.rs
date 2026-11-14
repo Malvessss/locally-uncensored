@@ -4220,6 +4220,10 @@ fn serve_or_heal_garbled(
         tracing::warn!(target: "engine", port, "the LU Engine found no graphics card it can use and serves on the processor");
         remember_sanity_note(state, note);
     }
+    if option_env!("LU_DIAGNOSTIC_NO_SANITY_PROBE") == Some("1") {
+        tracing::info!(target: "engine", port, "diagnostic build: skipped inference sanity probe");
+        return answer;
+    }
     // Measured once, from what llama-server itself printed on its way up. A
     // restart does not change the card, so this is not asked again.
     // GH #156: the pinned Vulkan build never prints its device line, so on
